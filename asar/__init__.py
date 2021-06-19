@@ -1,1 +1,1 @@
-from .archive import AsarArchive
+from .asar_archive import AsarArchive
