@@ -33,24 +33,23 @@ class AsarArchive:
         self.files = files
         self.baseoffset = baseoffset
 
-    def extract(self, destination):
+    def extract(self, destination, verbose=False):
         """Extracts the contents of the archive to the specifed directory.
 
         Args:
             destination (str):
                 Path to an empty directory to extract the files to.
+                
+            verbose(bool):
+                Output extracted files to console.
         """
 
         if os.path.exists(destination):
-            raise OSError(20, 'Destination exists', destination)
+            destination = os.path.join(destination, os.path.basename(self.filename.replace('.asar', '')))
 
-        self.__extract_directory(
-            '.',
-            self.files['files'],
-            destination
-        )
+        self.__extract_directory('.', self.files['files'], destination, verbose)
 
-    def __extract_directory(self, path, files, destination):
+    def __extract_directory(self, path, files, destination, verbose):
         """Extracts a single directory to the specified directory on disk.
 
         Args:
@@ -63,6 +62,9 @@ class AsarArchive:
 
             destination (str):
                 The path to extract the files to.
+                
+            verbose(bool):
+                Output extracted files to console.
         """
 
         # assures the destination directory exists
@@ -77,16 +79,17 @@ class AsarArchive:
             # recurse into them
             if 'files' in contents:
                 self.__extract_directory(
-                    item_path,
+                    item_path, 
                     contents['files'],
-                    destination
+                    destination,
+                    verbose
                 )
 
                 continue
 
-            self.__extract_file(item_path, contents, destination)
+            self.__extract_file(item_path, contents, destination, verbose)
 
-    def __extract_file(self, path, fileinfo, destination):
+    def __extract_file(self, path, fileinfo, destination, verbose):
         """Extracts the specified file to the specified destination.
 
         Args:
@@ -100,20 +103,21 @@ class AsarArchive:
 
             destination (str):
                 Directory to extract the archive to.
+                
+            verbose(bool):
+                Output extracted files to console.
         """
+
+        if (verbose):
+            print(f'Extracting {path}...')
 
         if 'offset' not in fileinfo:
             self.__copy_extracted(path, destination)
             return
 
-        self.asarfile.seek(
-            self.__absolute_offset(fileinfo['offset'])
-        )
-
         # TODO: read in chunks, ain't going to read multiple GB's in memory
-        contents = self.asarfile.read(
-            self.__absolute_offset(fileinfo['size'])
-        )
+        self.asarfile.seek(self.__absolute_offset(int(fileinfo['offset'])))
+        contents = self.asarfile.read(int(fileinfo['size']))
 
         destination_path = os.path.join(destination, path)
 
@@ -214,7 +218,9 @@ class AsarArchive:
         # read the actual header, which is a json string, again skip 8
         # bytes because of pickle padding
         asarfile.seek(asarfile.tell() + 8)
-        header = asarfile.read(header_size).decode('utf-8')
+        header = asarfile.read(header_size).rstrip(b'\0').decode('utf-8')
 
+        #with open('dump.txt', 'w', encoding='utf-8') as f: f.write(header)
         files = json.loads(header)
+
         return cls(filename, asarfile, files, asarfile.tell())
