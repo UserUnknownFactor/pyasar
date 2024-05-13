@@ -3,10 +3,17 @@ import json
 import shutil
 import os
 import logging
+import fnmatch
 
 
 logging.basicConfig(level=logging.INFO, format='%(message)s')
 LOGGER = logging.getLogger(__name__)
+
+def is_junk(file, patterns):
+    for pattern in patterns:
+        if fnmatch.fnmatch(file, pattern):
+            return True
+    return False
 
 class AsarArchive:
     """Class for unpacking and repacking Electron ASAR archives"""
@@ -19,7 +26,7 @@ class AsarArchive:
     def extract(self, destination, verbose=False):
         """Extracts the given `.asar` file."""
         if not destination:
-            destination = '.\\' + os.path.basename(self.filename.replace('.asar', ''))
+            destination = '.\\' + os.path.basename(os.path.splitext(self.filename)[0])
         self.__extract_directory('.', self.files['files'], destination, verbose)
 
     def __extract_directory(self, path, files, destination, verbose):
@@ -92,7 +99,7 @@ class AsarArchive:
             return cls(filename, open(filename, 'rb'), files, asarfile.tell())
 
     @staticmethod
-    def repack(source_dir, destination_asar=None, chunk_size=1024*1024, verbose=True):
+    def repack(source_dir, destination_asar=None, chunk_size=1024*1024, verbose=False, ignore_junk=[]):
         """Repacks the given directory into the specified `.asar` file."""
         if not destination_asar:
             destination_asar = os.path.join('.', f"{source_dir}.asar")
@@ -104,7 +111,11 @@ class AsarArchive:
 
         def build_file_list(directory, asar_dict):
             nonlocal offset
+            if ignore_junk and is_junk(directory, ignore_junk):
+                return
             for item in os.listdir(directory):
+                if ignore_junk and is_junk(item, ignore_junk):
+                    continue
                 item_path = os.path.join(directory, item)
                 if os.path.isdir(item_path):
                     asar_dict[item] = {'files': {}}

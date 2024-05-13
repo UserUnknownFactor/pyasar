@@ -26,7 +26,7 @@ PyAsar and can be installed through [pip](https://pypi.org/):
 ### Example command line usage
 
     asar -u app.asar
-    asar -r app
+    asar -r -n app
 
 ## Disclaimer / License
 
