@@ -23,9 +23,9 @@ def main():
     parser.add_argument('pathname', type=str, help='The ASAR file to process or input directory')
     group.add_argument('-r', '--repack', help='Repack game archive. Output defaults to "[directory].asar"', action='store_true')
     group.add_argument('-u', '--unpack', help='Unpack game archives. Output defaults to "[asar name without extension]"', action='store_true')
-    parser.add_argument('-d', '--directory', type=str, help='The directory of unpacked files')
+    parser.add_argument('-o', '--output', type=str, help='Output file or directory')
     parser.add_argument('-n', '--nojunk', help='Ignore common junk files', action='store_true')
-    
+    parser.add_argument('-i', '--integrity', help='Add file integrity info on repack', action='store_true') 
     args = parser.parse_args()
 
     import os
@@ -36,19 +36,18 @@ def main():
             exit(1)
         AsarArchive.repack(
             args.pathname, 
-            args.directory, 
+            args.output, 
             verbose=True, 
-            ignore_junk=(JUNK if args.nojunk else [])
+            ignore_junk=(JUNK if args.nojunk else []),
+            add_integrity = args.integrity
         )
-        print("Completed!")
     elif args.unpack:
         if not os.path.exists(args.pathname):
             parser.print_usage()
             print(f"Error: File '{args.pathname}' not found.")
             exit(1)
         with AsarArchive.open(args.pathname) as asar:
-            asar.extract(args.directory, verbose=True)
-        print("Completed!")
+            asar.extract(args.output, verbose=True)
     else:
         print("Please provide either --repack or --unpack option")
 

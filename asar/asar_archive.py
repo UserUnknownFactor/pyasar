@@ -2,8 +2,12 @@ import struct
 import json
 import shutil
 import os
+import hashlib
 import logging
 import fnmatch
+
+DEFAULT_CHUNK = 4194304
+DEFAULT_HASH = "sha256"
 
 
 logging.basicConfig(level=logging.INFO, format='%(message)s')
@@ -28,6 +32,7 @@ class AsarArchive:
         if not destination:
             destination = '.\\' + os.path.basename(os.path.splitext(self.filename)[0])
         self.__extract_directory('.', self.files['files'], destination, verbose)
+        LOGGER.info(f"Extracting to {destination} completed successfully.")
 
     def __extract_directory(self, path, files, destination, verbose):
         destination_path = os.path.join(destination, path)
@@ -51,13 +56,16 @@ class AsarArchive:
         self.asarfile.seek(self.__absolute_offset(int(fileinfo['offset'])))
         destination_path = os.path.join(destination, path)
         with open(destination_path, 'wb') as fp:
-            size = int(fileinfo['size'])
-            chunk_size = 1024 * 1024  # Read in 1 MB chunks
+            size = abs(int(fileinfo['size']))
+            if 'integrity' in fileinfo and 'blockSize' in fileinfo['integrity']:
+                block_size = min(abs(int(fileinfo['integrity']['blockSize'])), 1024 * 1024 * 512)
+            else:
+                block_size = DEFAULT_CHUNK  # Read in 4 MB chunks
             while size > 0:
-                read_size = min(chunk_size, size)
+                read_size = min(block_size, size)
                 contents = self.asarfile.read(read_size)
-                fp.write(contents)
                 size -= read_size
+                fp.write(contents)
 
         LOGGER.debug('Extracted %s to %s', path, destination_path)
 
@@ -99,8 +107,29 @@ class AsarArchive:
             return cls(filename, open(filename, 'rb'), files, asarfile.tell())
 
     @staticmethod
-    def repack(source_dir, destination_asar=None, chunk_size=1024*1024, verbose=False, ignore_junk=[]):
-        """Repacks the given directory into the specified `.asar` file."""
+    def calculate_integrity(filename, algorithm, block_size, file_size):
+        hash_func = getattr(hashlib, algorithm)()
+        block_hashes = []
+        with open(filename, "rb") as fp:
+            block_number = 0
+            while True:
+                data = fp.read(block_size)
+                if not data:
+                    break
+                block_hashes.append(getattr(hashlib, algorithm)(data).hexdigest())
+                hash_func.update(data)
+                block_number += 1
+        return {
+            "algorithm": algorithm.upper(),
+            "hash": hash_func.hexdigest(),
+            "blockSize": block_size,
+            "blocks": block_hashes
+        }
+
+    @staticmethod
+    def repack(source_dir, destination_asar=None, verbose=False, ignore_junk=[], add_integrity=True,
+                     block_size=DEFAULT_CHUNK, algorithm=DEFAULT_HASH):
+        """Repacks the given directory into the specified `.asar` file with integrity support """
         if not destination_asar:
             destination_asar = os.path.join('.', f"{source_dir}.asar")
 
@@ -109,24 +138,38 @@ class AsarArchive:
         file_list = {}
         offset = 0
 
-        def build_file_list(directory, asar_dict):
+        def build_file_list(directory, asar_dict, ignore_junk=False, algorithm='sha256', block_size=DEFAULT_CHUNK):
             nonlocal offset
             if ignore_junk and is_junk(directory, ignore_junk):
                 return
+            files = []
+            subdirectories = []
             for item in os.listdir(directory):
-                if ignore_junk and is_junk(item, ignore_junk):
-                    continue
                 item_path = os.path.join(directory, item)
                 if os.path.isdir(item_path):
-                    asar_dict[item] = {'files': {}}
-                    build_file_list(item_path, asar_dict[item]['files'])
+                    subdirectories.append((item, item_path))
                 else:
-                    size = os.path.getsize(item_path)
-                    asar_dict[item] = {
-                        'size': size,
-                        'offset': str(offset)
-                    }
-                    offset += size
+                    files.append((item, item_path))
+
+            for item, item_path in files:
+                size = os.path.getsize(item_path)
+                # dict's fields ordered this way to minimize difference with native implementation
+                asar_dict[item] = { 'size': size }
+                if add_integrity:
+                    asar_dict[item]['integrity'] = AsarArchive.calculate_integrity(
+                        item_path,
+                        algorithm=algorithm,
+                        block_size=block_size,
+                        file_size=size
+                    )
+                asar_dict[item]['offset'] = str(offset)
+                offset += size
+
+            for item, item_path in subdirectories:
+                if ignore_junk and is_junk(item, ignore_junk):
+                    continue
+                asar_dict[item] = {'files': {}}
+                build_file_list(item_path, asar_dict[item]['files'], ignore_junk, algorithm, block_size)
 
         build_file_list(source_dir, file_list)
 
@@ -138,7 +181,7 @@ class AsarArchive:
             asar_out.write(struct.pack('<I', 4))
             asar_out.write(struct.pack('<I', aligned_json_size + 8))
             asar_out.write(struct.pack('<I', aligned_json_size + 4))
-            asar_out.write(struct.pack('<I', json_size - 1)) # or json_size?
+            asar_out.write(struct.pack('<I', json_size)) # or json_size - 1?
             asar_out.write(header)
             asar_out.write(b'\0' * (aligned_json_size - json_size))
 
@@ -153,9 +196,10 @@ class AsarArchive:
                         with open(item_path, 'rb') as f:
                             remaining_size = meta['size']
                             while remaining_size > 0:
-                                buffer = f.read(min(chunk_size, remaining_size))
+                                buffer = f.read(min(block_size, remaining_size))
                                 asar_out.write(buffer)
                                 remaining_size -= len(buffer)
 
             write_files(source_dir, file_list)
 
+        LOGGER.info("Repacking completed successfully.")
