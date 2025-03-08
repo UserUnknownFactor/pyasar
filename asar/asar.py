@@ -25,6 +25,7 @@ def main():
     parser.add_argument('pathname', nargs='?', type=str, default='', help='ASAR file or input directory to process (default: app.asar/app)')
     group.add_argument('-r', '--repack', help='Repack game archive. Output defaults to "[directory].asar"', action='store_true')
     group.add_argument('-u', '--unpack', help='Unpack game archives. Output defaults to "[asar_name without extension]"', action='store_true')
+    parser.add_argument('-e', '--external', type=str, help='Externalize specific files in the asar (comma separated mask or file list)')
     parser.add_argument('-o', '--output', type=str, help='Output file or directory')
     parser.add_argument('-n', '--nojunk', help='Ignore common junk files', action='store_true')
     parser.add_argument('-i', '--integrity', help='Add file integrity info on repack', action='store_true') 
@@ -46,6 +47,16 @@ def main():
             ignore_junk=(JUNK if args.nojunk else []),
             add_integrity = args.integrity
         )
+    elif args.external:
+        file_path = args.pathname
+        if file_path == '' and os.path.exists(DEFAULT_FILENAME):
+            file_path = DEFAULT_FILENAME
+        if not os.path.exists(file_path):
+            parser.print_usage()
+            print(f"Error: File '{file_path}' not found.")
+            exit(1)
+        with AsarArchive.open(file_path, "r+b") as asar:
+            asar.externalize(args.external, verbose=True)
     elif args.unpack:
         file_path = args.pathname
         if file_path == '' and os.path.exists(DEFAULT_FILENAME):
