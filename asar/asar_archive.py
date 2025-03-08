@@ -1,10 +1,4 @@
-import struct
-import json
-import shutil
-import os
-import hashlib
-import logging
-import fnmatch
+import struct, json, shutil, os, re, hashlib, logging, fnmatch
 
 DEFAULT_CHUNK = 4194304
 DEFAULT_HASH = "sha256"
@@ -20,13 +14,132 @@ def is_junk(file, patterns):
 
 class AsarArchive:
     """ Class for unpacking and repacking Electron ASAR archives """
-    def __init__(self, filename, asarfile, files, baseoffset):
+    def __init__(self, filename, mode, files, baseoffset):
         self.filename = filename
-        self.asarfile = asarfile
+        self.asarfile = open(filename, mode)
         self.files = files
         self.baseoffset = baseoffset
 
-    def extract(self, destination, verbose=False):
+    def replace(self, file:str, fileinfo:str, verbose:bool=True):
+        text_extensions = [".js", ".html", ".ks", ".txt", ".csv", ".json", ".tjs"]
+        is_text = any(file.endswith(ext) for ext in text_extensions)
+        f_size = os.stat(file).st_size
+        old_size = int(fileinfo["size"])
+        if (not is_text and f_size != old_size) or (is_text and f_size > old_size):
+            if verbose:
+                LOGGER.error(f"The size of file {file} ({f_size}) does't match the file in ASAR ({fileinfo['size']}); difference: {f_size - int(fileinfo['size'])}")
+            return False
+        if not os.path.isfile(file):
+            if verbose:
+                LOGGER.error(f"The file {file} is not found")
+            return False
+        with open(file, 'rb') as f:
+            data = f.read()
+            pad_size = (old_size - len(data))
+            if is_text and pad_size > 0:
+                data += b'\x0d' * pad_size# just pad the text
+                LOGGER.info(f"Padded the data with {pad_size} 0xD bytes")
+            if len(data) != old_size:
+                if verbose:
+                    LOGGER.error(f"The read size of file {file} does't match the file in ASAR ({len(data)} != {fileinfo['size']})")
+                return False
+            self.asarfile.seek(self.__absolute_offset(int(fileinfo["offset"])))
+            self.asarfile.write(data)
+            return True
+        return False
+
+    def replace_by_dir(self, file_patterns:list, replacement_dir:str, verbose:bool=True):
+        all_files = []
+        AsarArchive.collect_files(self.files, all_files)
+
+        files_to_modify = AsarArchive.find_files(file_patterns, all_files)
+        if not files_to_modify:
+            if verbose:
+                LOGGER.warning(f'No matching files found from {file_patterns}')
+            return
+        for normalized_path, fileinfo in files_to_modify:
+            real_path = os.path.join(replacement_dir, normalized_path)
+            if self.replace(real_path, fileinfo, verbose):
+                LOGGER.info(f"Repaced {normalized_path} with {real_path}")
+
+    @staticmethod
+    def collect_files(obj, all_files, path=""):
+        if not isinstance(obj, dict): return
+        if 'files' in obj:
+            AsarArchive.collect_files(obj['files'], all_files, path)
+        else:
+            for key, value in obj.items():
+                new_path = f"{path}/{key}" if path else key
+                if isinstance(value, dict):
+                    if 'size' in value or 'offset' in value:
+                        all_files.append((new_path, value))
+                    else:
+                        AsarArchive.collect_files(value, all_files, new_path)
+
+    @staticmethod
+    def find_files(file_patterns, all_files):
+        files_to_modify = []
+        for file_path, file_obj in all_files:
+            normalized_path = file_path.rstrip('/')
+            for pattern in file_patterns:
+                normalized_pattern = pattern.rstrip('/')
+                if re.compile(normalized_pattern).match(normalized_path):
+                    #LOGGER.debug(f"{normalized_path}, {normalized_pattern}")
+                    files_to_modify.append((normalized_path, file_obj))
+                    break
+        return files_to_modify
+
+    def externalize(self, file_patterns: list, dump_file: str=None, verbose:bool=True):
+        all_files = []
+        AsarArchive.collect_files(self.files, all_files)
+
+        files_to_modify = AsarArchive.find_files(file_patterns, all_files)
+        if not files_to_modify:
+            if verbose:
+                LOGGER.info(f'No matching files found from {file_patterns}')
+            return
+
+        modified_count = 0
+        content = self.content
+        for normalized_path, file_obj in files_to_modify:
+            file_name = normalized_path.split('/')[-1]
+            pattern = r'"' + re.escape(file_name) + r'\"\s*:(\{[^\}]+?"offset":"?'+ str(file_obj['offset']) +'"?[^\}]*?\})'
+            #LOGGER.debug(pattern)
+            matches = list(re.finditer(pattern, content))
+            for match in matches:
+                original_entry = match.group(0)
+                file_obj_str = match.group(1)
+
+                if ('size' in file_obj and '"size":' in file_obj_str) or ('offset' in file_obj and '"offset":' in file_obj_str):
+                    new_entry = f'"{file_name}":{{"unpacked":true}}'
+                    length_diff = len(original_entry) - len(new_entry)
+                    if length_diff < 0:
+                        LOGGER.error(f"New entry for {normalized_path} is {length_diff} bytes longer than the original")
+                    elif length_diff > 0:
+                        new_entry = new_entry[:-1] + ' ' * length_diff + '}'
+                    content = content.replace(original_entry, new_entry, 1)
+                    LOGGER.debug(f"Replacing pattern for {normalized_path}: {original_entry} -> {new_entry}")
+                    modified_count += 1
+                    break
+
+        content = content.encode("utf-8") + self.zeros
+        if len(content) != self.json_size:
+            LOGGER.error("The JSON data should keep the same length")
+            return
+        if dump_file:
+            dump_file = os.path.abspath(dump_file)
+            with open(dump_file, "wb") as o:
+                o.write(content)
+                LOGGER.info(f"JSON header is written to {dump_file}")
+        elif modified_count > 0:
+            self.asarfile.seek(16)
+            self.asarfile.write(content)
+            if verbose:
+                LOGGER.info(f'Externalized {modified_count} file entries ({files_to_modify}) in the ASAR header; \nthey can now be put in "{self.filename}.unpacked" folder')
+        else:
+            LOGGER.warning(f'No matching entries found')
+
+    def extract(self, destination:str, verbose:bool=False):
         """Extracts the given `.asar` file."""
         if not destination:
             destination = ".\\" + os.path.basename(os.path.splitext(self.filename)[0])
@@ -75,7 +188,7 @@ class AsarArchive:
     
         LOGGER.debug(f"Extracted {path} to {destination_path}")
     
-    def __copy_extracted(self, path, destination, verbose):
+    def __copy_extracted(self, path:str, destination:str, verbose:bool):
         unpacked_dir = self.filename + ".unpacked"
         if not os.path.isdir(unpacked_dir):
             if verbose:
@@ -91,7 +204,7 @@ class AsarArchive:
         destination_path = os.path.join(destination, path)
         shutil.copyfile(source_path, destination_path)
 
-    def __absolute_offset(self, offset):
+    def __absolute_offset(self, offset:int|str):
         return int(offset) + self.baseoffset
 
     def __enter__(self):
@@ -103,17 +216,23 @@ class AsarArchive:
             self.asarfile = None
 
     @classmethod
-    def open(cls, filename):
-        with open(filename, "rb") as asarfile:
+    def open(cls, filename:str, mode:str="rb"):
+        with open(filename, mode) as asarfile:
             asarfile.seek(4)
-            json_size = struct.unpack('I', asarfile.read(4))[0] - 8
+            cls.json_size = struct.unpack('I', asarfile.read(4))[0] - 8
+            file_size = asarfile.seek(0, 2)
+            if file_size < cls.json_size or cls.json_size == 0:
+                raise Exception("Unknown file format")
             asarfile.seek(16)
-            header = asarfile.read(json_size).rstrip(b'\0').decode("utf-8")
-            files = json.loads(header)
-            return cls(filename, open(filename, "rb"), files, asarfile.tell())
+            cls.content = asarfile.read(cls.json_size)
+            n_right_zeroes = 0 if cls.content[len(cls.content)-1] != 0 else next((i for i, c in enumerate(cls.content[::-1]) if c != 0)) # :)
+            cls.zeros = cls.content[-n_right_zeroes:] if n_right_zeroes else b''
+            cls.content = (cls.content[:-n_right_zeroes] if n_right_zeroes > 0 else cls.content).decode("utf-8")
+            files = json.loads(cls.content)
+            return cls(filename, mode, files, asarfile.tell())
 
     @staticmethod
-    def calculate_integrity(filename, algorithm, block_size, file_size):
+    def calculate_integrity(filename:str, algorithm:str, block_size:int, file_size:int):
         hash_class = getattr(hashlib, algorithm)
         hash_processor = hash_class()
         block_hashes = []
@@ -134,8 +253,9 @@ class AsarArchive:
         }
 
     @staticmethod
-    def repack(source_dir, destination_asar=None, verbose=False, ignore_junk=[], add_integrity=True,
-                     block_size=DEFAULT_CHUNK, algorithm=DEFAULT_HASH, executable_files=[]):
+    def repack(source_dir:str, destination_asar:str=None, verbose:bool=False,
+        ignore_junk:list=[], add_integrity:bool=True, block_size:int=DEFAULT_CHUNK,
+        algorithm:str=DEFAULT_HASH, executable_files:list=[]):
         """ Repacks the given directory into the specified `.asar` """
         if not destination_asar:
             destination_asar = os.path.join('.', f"{source_dir}.asar")
