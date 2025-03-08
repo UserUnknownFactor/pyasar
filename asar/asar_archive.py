@@ -1,10 +1,4 @@
-import struct
-import json
-import shutil
-import os
-import hashlib
-import logging
-import fnmatch
+import struct, json, shutil, os, re, hashlib, logging, fnmatch
 
 DEFAULT_CHUNK = 4194304
 DEFAULT_HASH = "sha256"
@@ -25,6 +19,105 @@ class AsarArchive:
         self.asarfile = asarfile
         self.files = files
         self.baseoffset = baseoffset
+
+    def externalize(self, file_patterns: [str|list], verbose=True):
+        if isinstance(file_patterns, str):
+            file_patterns = [pattern.replace('\\', '/').strip() for pattern in file_patterns.split(',')]
+
+        f = self.asarfile
+        f.seek(4)
+        json_size = struct.unpack('I', f.read(4))[0] - 8
+        f.seek(16)
+        content = f.read(json_size).decode("utf-8")
+        old_content_len = len(content)
+
+        try:
+            header_data = json.loads(content)
+            all_files = []
+        except json.JSONDecodeError:
+            LOGGER.error("Could not parse the ASAR header as valid JSON")
+            return
+
+        all_files = []
+        def collect_files(obj, path=""):
+            if isinstance(obj, dict):
+                if 'files' in obj:
+                    collect_files(obj['files'], path)
+                else:
+                    for key, value in obj.items():
+                        new_path = f"{path}/{key}" if path else key
+                        if isinstance(value, dict):
+                            if 'size' in value or 'offset' in value:
+                                all_files.append((new_path, value))
+                            else:
+                                collect_files(value, new_path)
+
+        collect_files(header_data)
+
+        files_to_modify = []
+        for file_path, file_obj in all_files:
+            normalized_path = file_path.lstrip('/')
+            for pattern in file_patterns:
+                normalized_pattern = pattern.lstrip('/')
+                if fnmatch.fnmatch(normalized_path, normalized_pattern):
+                    files_to_modify.append((file_path, file_obj))
+                    break
+                    
+        if not files_to_modify:
+            if verbose:
+                LOGGER.info(f'No matching files found')
+            return
+
+        modified_count = 0
+        for file_path, file_obj in files_to_modify:
+            file_name = file_path.split('/')[-1]
+            original_json = json.dumps({file_name: file_obj})
+            modified_obj = {}
+            modified_obj['unpacked'] = True
+            modified_json = json.dumps({file_name: modified_obj})
+
+            escaped_json = re.escape(original_json).replace('\\"', '(?:\\"|")')
+            match = re.search(escaped_json, content)
+            if match:
+                original_entry = match.group(0)
+                length_diff = len(original_entry) - len(modified_json)
+                if length_diff < 0:
+                    LOGGER.error(f"New entry for {file_path} is {length_diff} bytes longer than the original")
+                if length_diff > 0:
+                    modified_json = modified_json[:-1] + ' ' * length_diff + '}'
+
+                content = content.replace(original_entry, modified_json, 1)
+                modified_count += 1
+            else:
+                # if we couldn't find it, try a more flexible approach
+                pattern = r'"' + re.escape(file_name) + r'"\s*:(\{[^\{\}]*(?:\{[^\{\}]*\}[^\{\}]*)*\})'
+                matches = list(re.finditer(pattern, content))
+                for match in matches:
+                    original_entry = match.group(0)
+                    file_obj_str = match.group(1)
+
+                    if ('size' in file_obj and '"size":' in file_obj_str) or \
+                       ('offset' in file_obj and '"offset":' in file_obj_str):
+                        new_entry = f'"{file_name}":{{"unpacked":true}}'
+                        length_diff = len(original_entry) - len(new_entry)
+                        if length_diff < 0:
+                            LOGGER.error(f"New entry for {file_path} is {length_diff} bytes longer than the original")
+
+                        if length_diff > 0:
+                            new_entry = new_entry[:-1] + ' ' * length_diff + '}'
+
+                        content = content.replace(original_entry, new_entry, 1)
+                        modified_count += 1
+                        break
+
+        if len(content) != old_content_len:
+            LOGGER.error("The JSON data should keep the same length")
+            return
+        if modified_count > 0:
+            f.seek(16)
+            f.write(content.encode("utf-8"))
+            if verbose:
+                LOGGER.info(f'Externalized {modified_count} file entries in the ASAR header; \nthey can now be put in "{self.filename}.unpacked" folder now')
 
     def extract(self, destination, verbose=False):
         """Extracts the given `.asar` file."""
@@ -103,14 +196,14 @@ class AsarArchive:
             self.asarfile = None
 
     @classmethod
-    def open(cls, filename):
-        with open(filename, "rb") as asarfile:
+    def open(cls, filename, mode="rb"):
+        with open(filename, mode) as asarfile:
             asarfile.seek(4)
             json_size = struct.unpack('I', asarfile.read(4))[0] - 8
             asarfile.seek(16)
             header = asarfile.read(json_size).rstrip(b'\0').decode("utf-8")
             files = json.loads(header)
-            return cls(filename, open(filename, "rb"), files, asarfile.tell())
+            return cls(filename, open(filename, mode), files, asarfile.tell())
 
     @staticmethod
     def calculate_integrity(filename, algorithm, block_size, file_size):

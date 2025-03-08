@@ -25,14 +25,20 @@ PyASAR and can be installed through [pip](https://pypi.org/):
 
 ### Example command line usage
 
+Unpack app.asar:  
+
     asar -u app.asar
     asar -u
+
+Repack app.asar with integrity field and no junk files:  
+
     asar -r -i -n -o app.asar app_unpacked
 
-## Disclaimer / License
+Externalize index-aabcdef.js to be put in `app.asar.unpacked`:  
+
+    asar -e *\assets\index-*.js
+
+## Disclaimer
 
 This is no way associated with Github, Electron or Atom.  
 It is free (free as in beer) and open-source for fun and non-profit.  
-
-Licensed under the
-[*Do What The Fuck You Want To Public License*](http://www.wtfpl.net/).
